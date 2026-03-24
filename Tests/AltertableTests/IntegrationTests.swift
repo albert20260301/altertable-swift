@@ -1,0 +1,339 @@
+//
+//  IntegrationTests.swift
+//  AltertableTests
+//
+
+@testable import Altertable
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+import Foundation
+import XCTest
+
+// Integration tests run against the altertable-mock server (ghcr.io/altertable-ai/altertable-mock).
+// In CI the mock is started automatically via the GitHub Actions service defined in test.yml.
+// To run locally: docker run -p 15001:15001 \
+//   -e ALTERTABLE_MOCK_API_KEYS="test_pk_abc123" \
+//   -e ALTERTABLE_MOCK_ENVIRONMENTS="production,integration-test" \
+//   ghcr.io/altertable-ai/altertable-mock
+
+final class IntegrationTests: XCTestCase {
+    private static let mockBaseURL = URL(string: "http://localhost:15001")!
+    private static let apiKey = "test_pk_abc123"
+    private static let environment = "integration-test"
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        SDKConstants.StorageKeys.all.forEach { UserDefaults.standard.removeObject(forKey: $0) }
+        try skipIfServerUnavailable()
+    }
+
+    // MARK: - Helpers
+
+    private func skipIfServerUnavailable() throws {
+        let url = URL(string: "\(IntegrationTests.mockBaseURL)/health")!
+        let semaphore = DispatchSemaphore(value: 0)
+        var reachable = false
+        URLSession.shared.dataTask(with: url) { _, response, _ in
+            reachable = (response as? HTTPURLResponse) != nil
+            semaphore.signal()
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + 1.5)
+        try XCTSkipUnless(
+            reachable,
+            "Integration mock server not available at \(IntegrationTests.mockBaseURL). " +
+                "Run: docker run -p 15001:15001 " +
+                "-e ALTERTABLE_MOCK_API_KEYS=test_pk_abc123 " +
+                "-e ALTERTABLE_MOCK_ENVIRONMENTS=production,integration-test " +
+                "ghcr.io/altertable-ai/altertable-mock"
+        )
+    }
+
+    /// Returns a client pre-configured for the mock plus an inverted expectation that
+    /// fails the test if `onError` is ever called.
+    private func makeClient(environment: String = IntegrationTests.environment) -> (Altertable, XCTestExpectation) {
+        let noErrorExp = expectation(description: "No error (\(environment))")
+        noErrorExp.isInverted = true
+
+        let config = AltertableConfig(
+            baseURL: IntegrationTests.mockBaseURL,
+            environment: environment,
+            onError: { error in
+                XCTFail("Unexpected SDK error: \(error)")
+                noErrorExp.fulfill()
+            }
+        )
+        let client = Altertable(apiKey: IntegrationTests.apiKey, config: config)
+        // Speed up retries so a genuine error surfaces quickly in tests.
+        client.setRetryBaseDelay(0.1)
+        return (client, noErrorExp)
+    }
+
+    // MARK: - track
+
+    func testTrackSucceeds() {
+        let (client, noError) = makeClient()
+
+        client.track(event: "Button Clicked", properties: [
+            "button": JSONValue("signup"),
+            "page": JSONValue("home"),
+        ])
+
+        wait(for: [noError], timeout: 3.0)
+    }
+
+    // MARK: - identify
+
+    func testIdentifySucceeds() {
+        let (client, noError) = makeClient()
+
+        client.identify(userId: "user_integration_123", traits: [
+            "plan": JSONValue("premium"),
+            "email": JSONValue("test@example.com"),
+        ])
+
+        wait(for: [noError], timeout: 3.0)
+    }
+
+    // MARK: - alias
+
+    func testAliasSucceeds() {
+        let (client, noError) = makeClient()
+
+        client.identify(userId: "user_pre_alias")
+        client.alias(newUserId: "user_post_alias")
+
+        wait(for: [noError], timeout: 3.0)
+    }
+
+    // MARK: - updateTraits
+
+    func testUpdateTraitsSucceeds() {
+        let (client, noError) = makeClient()
+
+        client.identify(userId: "user_traits_123")
+        client.updateTraits([
+            "plan": JSONValue("enterprise"),
+            "onboarded": JSONValue(true),
+        ])
+
+        wait(for: [noError], timeout: 3.0)
+    }
+
+    // MARK: - Error cases
+
+    func testUnknownEnvironmentErrors() {
+        let errorExp = expectation(description: "Error for unknown environment")
+
+        let config = AltertableConfig(
+            baseURL: IntegrationTests.mockBaseURL,
+            environment: "nonexistent-env",
+            onError: { _ in errorExp.fulfill() }
+        )
+        let client = Altertable(apiKey: IntegrationTests.apiKey, config: config)
+        client.setRetryBaseDelay(0.1)
+
+        client.track(event: "should_fail")
+
+        wait(for: [errorExp], timeout: 5.0)
+    }
+
+    func testInvalidApiKeyErrors() {
+        let errorExp = expectation(description: "Error for invalid API key")
+
+        let config = AltertableConfig(
+            baseURL: IntegrationTests.mockBaseURL,
+            environment: IntegrationTests.environment,
+            onError: { _ in errorExp.fulfill() }
+        )
+        let client = Altertable(apiKey: "invalid_key_xyz", config: config)
+        client.setRetryBaseDelay(0.1)
+
+        client.track(event: "should_fail")
+
+        wait(for: [errorExp], timeout: 5.0)
+    }
+
+    // MARK: - Full funnel
+
+    func testFullAnonymousToIdentifiedFunnel() {
+        let (client, noError) = makeClient()
+
+        // Anonymous phase
+        client.track(event: "Page Viewed", properties: ["page": JSONValue("landing")])
+
+        // Identification
+        client.identify(userId: "user_funnel_789", traits: [
+            "email": JSONValue("funnel@example.com"),
+            "source": JSONValue("organic"),
+        ])
+
+        // Authenticated events
+        client.track(event: "Signup Completed")
+        client.track(event: "Plan Selected", properties: ["plan": JSONValue("pro"), "price": JSONValue(29)])
+        client.updateTraits(["onboarded": JSONValue(true)])
+
+        wait(for: [noError], timeout: 5.0)
+    }
+
+    // MARK: - Consent
+
+    func testConsentPendingQueuesThenFlushesOnGrant() {
+        let noError = expectation(description: "No error after consent granted")
+        noError.isInverted = true
+
+        let config = AltertableConfig(
+            baseURL: IntegrationTests.mockBaseURL,
+            environment: IntegrationTests.environment,
+            trackingConsent: .pending,
+            onError: { error in
+                XCTFail("Unexpected SDK error: \(error)")
+                noError.fulfill()
+            }
+        )
+        let client = Altertable(apiKey: IntegrationTests.apiKey, config: config)
+        client.setRetryBaseDelay(0.1)
+
+        // Queued while consent is pending — must not be sent yet
+        client.track(event: "queued_event", properties: ["source": JSONValue("pre-consent")])
+        client.identify(userId: "user_pending_consent")
+
+        // Granting consent flushes the queue
+        client.configure { $0.trackingConsent = .granted }
+
+        wait(for: [noError], timeout: 5.0)
+    }
+
+    // MARK: - Batch
+
+    func testMultipleSequentialEventsSucceed() {
+        let (client, noError) = makeClient()
+
+        client.identify(userId: "user_batch_456")
+        for step in 1 ... 5 {
+            client.track(event: "Step Completed", properties: ["step": JSONValue(step)])
+        }
+
+        wait(for: [noError], timeout: 5.0)
+    }
+
+    // MARK: - Batching Behavior
+
+    func testBatchThresholdFlushSucceeds() {
+        let noError = expectation(description: "No error after batch flush")
+        noError.isInverted = true
+
+        let config = AltertableConfig(
+            baseURL: IntegrationTests.mockBaseURL,
+            environment: IntegrationTests.environment,
+            onError: { error in
+                XCTFail("Unexpected SDK error: \(error)")
+                noError.fulfill()
+            },
+            flushAt: 3
+        )
+        let client = Altertable(apiKey: IntegrationTests.apiKey, config: config)
+        client.setRetryBaseDelay(0.1)
+
+        client.track(event: "batch_threshold_0")
+        client.track(event: "batch_threshold_1")
+        client.track(event: "batch_threshold_2")
+
+        wait(for: [noError], timeout: 5.0)
+    }
+
+    func testBatchMaxBatchSizeChunkingSucceeds() {
+        let noError = expectation(description: "No error with chunked batch")
+        noError.isInverted = true
+
+        let config = AltertableConfig(
+            baseURL: IntegrationTests.mockBaseURL,
+            environment: IntegrationTests.environment,
+            onError: { error in
+                XCTFail("Unexpected SDK error: \(error)")
+                noError.fulfill()
+            },
+            flushAt: 100,
+            maxBatchSize: 5
+        )
+        let client = Altertable(apiKey: IntegrationTests.apiKey, config: config)
+        client.setRetryBaseDelay(0.1)
+
+        for i in 0 ..< 12 {
+            client.track(event: "chunked_event_\(i)", properties: ["index": JSONValue(i)])
+        }
+
+        wait(for: [noError], timeout: 5.0)
+    }
+
+    func testBatchMixedEventTypesSucceeds() {
+        let noError = expectation(description: "No error with mixed types")
+        noError.isInverted = true
+
+        let config = AltertableConfig(
+            baseURL: IntegrationTests.mockBaseURL,
+            environment: IntegrationTests.environment,
+            onError: { error in
+                XCTFail("Unexpected SDK error: \(error)")
+                noError.fulfill()
+            },
+            flushAt: 100
+        )
+        let client = Altertable(apiKey: IntegrationTests.apiKey, config: config)
+        client.setRetryBaseDelay(0.1)
+
+        client.identify(userId: "user_mixed_batch", traits: ["source": JSONValue("integration")])
+        client.track(event: "mixed_track_1")
+        client.track(event: "mixed_track_2")
+        client.updateTraits(["plan": JSONValue("pro")])
+        client.track(event: "mixed_track_3")
+
+        wait(for: [noError], timeout: 5.0)
+    }
+
+    func testBatchPeriodicFlushSucceeds() {
+        let noError = expectation(description: "No error with periodic flush")
+        noError.isInverted = true
+
+        let config = AltertableConfig(
+            baseURL: IntegrationTests.mockBaseURL,
+            environment: IntegrationTests.environment,
+            onError: { error in
+                XCTFail("Unexpected SDK error: \(error)")
+                noError.fulfill()
+            },
+            flushAt: 100,
+            flushInterval: 2
+        )
+        let client = Altertable(apiKey: IntegrationTests.apiKey, config: config)
+        client.setRetryBaseDelay(0.1)
+
+        client.track(event: "periodic_flush_event")
+
+        wait(for: [noError], timeout: 5.0)
+    }
+
+    func testBatchManualFlushSucceeds() {
+        let noError = expectation(description: "No error with manual flush")
+        noError.isInverted = true
+
+        let config = AltertableConfig(
+            baseURL: IntegrationTests.mockBaseURL,
+            environment: IntegrationTests.environment,
+            trackingConsent: .pending,
+            onError: { error in
+                XCTFail("Unexpected SDK error: \(error)")
+                noError.fulfill()
+            },
+            flushAt: 100
+        )
+        let client = Altertable(apiKey: IntegrationTests.apiKey, config: config)
+        client.setRetryBaseDelay(0.1)
+
+        client.track(event: "manual_flush_queued")
+        client.configure { $0.trackingConsent = .granted }
+        client.flush()
+
+        wait(for: [noError], timeout: 5.0)
+    }
+}
